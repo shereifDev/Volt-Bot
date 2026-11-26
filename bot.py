@@ -1,3 +1,4 @@
+import asyncio
 import os
 from threading import Thread
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -6,11 +7,12 @@ from datetime import time
 from zoneinfo import ZoneInfo
 
 from telegram import Update, ChatPermissions
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram.ext import Application, CommandHandler, ConversationHandler, MessageHandler, ContextTypes, filters
 
 from config import BOT_TOKEN, TIMEZONE, LOCK_TIME, UNLOCK_TIME, OWNER_IDS
 from database import (
-    init_db, register_group, get_groups, add_global_reply, delete_global_reply,
+    init_db, register_group, set_group_committee, get_groups, get_groups_detailed,
+    list_committee_names, add_global_reply, delete_global_reply,
     edit_global_reply, list_global_replies, set_reply_enabled,
     get_saved_permissions, save_permissions, clear_saved_permissions
 )
@@ -67,7 +69,8 @@ async def start(update, context):
             "إدارة الردود:\n"
             "/editreply old_keyword | new_keyword | new_text_response\n"
             "/delreply keyword\n/replies\n/enable keyword\n/disable keyword\n\n"
-            "كل الردود بتشتغل في كل الجروبات."
+            "كل الردود بتشتغل في كل الجروبات.\n\n"
+            "📢 برودكاست للجروبات:\n/broadcast"
         )
     else:
         await update.effective_message.reply_text(
@@ -257,12 +260,28 @@ async def setup(update, context):
     if not await group_admin_or_creator(update, context):
         return
     chat = update.effective_chat
-    register_group(chat.id, chat.title or str(chat.id))
+    committee_name = " ".join(context.args).strip() or None
+    register_group(chat.id, chat.title or str(chat.id), committee_name)
+    name_line = f"الكوميتي: {committee_name}\n" if committee_name else "تقدر تحدد اسم الكوميتي بـ /setname.\n"
     schedule_group(context.application, chat.id)
     await update.effective_message.reply_text(
-        "✅ اتسجل الجروب.\nالردود العامة شغالة هنا تلقائيًا.\n"
+        "✅ اتسجل الجروب.\n" + name_line +
+        "الردود العامة شغالة هنا تلقائيًا.\n"
         "القفل 12 منتصف الليل والفتح 8 صباحًا بتوقيت القاهرة."
     )
+
+
+async def setname(update, context):
+    if not await group_admin_or_creator(update, context):
+        return
+    committee_name = " ".join(context.args).strip()
+    if not committee_name:
+        await update.effective_message.reply_text("استخدم: /setname اسم_الكوميتي\nمثال: /setname Python")
+        return
+    if set_group_committee(update.effective_chat.id, committee_name):
+        await update.effective_message.reply_text(f"✅ الجروب اتربط بكوميتي: {committee_name}")
+    else:
+        await update.effective_message.reply_text("الجروب ده مش متسجل. نفّذ /setup الأول.")
 
 
 async def lock_cmd(update, context):
@@ -290,10 +309,152 @@ async def unlock_cmd(update, context):
 async def help_cmd(update, context):
     await update.effective_message.reply_text(
         "🤖 El Nazer Bot | IEEE Al-Azhar\n"
-        "/setup — تسجيل الجروب وتفعيل الجدول\n/lock — قفل الآن\n"
-        "/unlock — فتح الآن\n/help — المساعدة\n"
+        "/setup اسم_الكوميتي — تسجيل الجروب وتفعيل الجدول (اسم الكوميتي اختياري)\n"
+        "/setname اسم_الكوميتي — تحديد أو تغيير كوميتي الجروب\n"
+        "/lock — قفل الآن\n/unlock — فتح الآن\n/help — المساعدة\n"
         "الأوامر الإدارية متاحة لأدمن الجروب والـ Owner (Creator)."
     )
+
+
+
+# ---------- Broadcast to groups: owner private chat ----------
+
+BROADCAST_TARGET, BROADCAST_CONTENT, BROADCAST_CONFIRM = range(3)
+CONFIRM_WORDS = {"نعم", "ايوه", "أيوه", "اه", "أه", "تمام", "أكيد", "اكيد", "yes", "y", "ok"}
+CANCEL_WORDS = {"إلغاء", "الغاء", "cancel"}
+ALL_WORDS = {"الكل", "كل", "all", "الكل الجروبات", "كل الجروبات"}
+BROADCAST_DELAY_SECONDS = 0.4
+
+
+def _clear_broadcast(user_data):
+    user_data.pop("broadcast_targets", None)
+    user_data.pop("broadcast_content", None)
+
+
+async def broadcast_start(update, context):
+    if not await owner_private_only(update):
+        return ConversationHandler.END
+    committees = list_committee_names()
+    total = len(get_groups())
+    if total == 0:
+        await update.effective_message.reply_text("مفيش جروبات متسجلة لسه. سجّل جروب بـ /setup الأول.")
+        return ConversationHandler.END
+    lines = ["📢 البرودكاست يروح لمين؟", "", "• ابعت: الكل — لكل الجروبات"]
+    if committees:
+        lines.append("• أو اسم كوميتي واحدة، أو أكتر من كوميتي مفصولين بفاصلة:")
+        lines.append("  " + "، ".join(committees))
+    lines.append("")
+    lines.append("ابعت /cancel أو «إلغاء» في أي وقت للإلغاء.")
+    await update.effective_message.reply_text("\n".join(lines))
+    return BROADCAST_TARGET
+
+
+async def broadcast_target(update, context):
+    text = (update.effective_message.text or "").strip()
+    if text.casefold() in CANCEL_WORDS:
+        return await broadcast_cancel(update, context)
+
+    detailed = get_groups_detailed()
+    if text.casefold() in ALL_WORDS:
+        targets = detailed
+    else:
+        wanted = [part.strip() for part in text.replace("،", ",").split(",") if part.strip()]
+        known = {name.casefold(): name for name in list_committee_names()}
+        unknown = [name for name in wanted if name.casefold() not in known]
+        if unknown:
+            committees = list_committee_names()
+            await update.effective_message.reply_text(
+                "مش لاقي الكوميتي دي: " + "، ".join(unknown) +
+                "\nالكوميتيز المتاحة: " + ("، ".join(committees) if committees else "لسه مفيش — استخدم /setname في الجروبات") +
+                "\nحاول تاني أو ابعت: الكل"
+            )
+            return BROADCAST_TARGET
+        wanted_cf = {name.casefold() for name in wanted}
+        targets = [row for row in detailed if (row[2] or "").casefold() in wanted_cf]
+
+    if not targets:
+        await update.effective_message.reply_text("مفيش جروبات مطابقة للاختيار ده. حاول تاني.")
+        return BROADCAST_TARGET
+
+    context.user_data["broadcast_targets"] = targets
+    names = "، ".join(title or str(chat_id) for chat_id, title, _ in targets)
+    await update.effective_message.reply_text(
+        f"🎯 المستهدف: {len(targets)} جروب ({names})\n\n"
+        "ابعت الرسالة دلوقتي: نص أو صورة أو فيديو أو صوت أو Voice."
+    )
+    return BROADCAST_CONTENT
+
+
+async def broadcast_content(update, context):
+    message = update.effective_message
+    if message.text and message.text.strip().casefold() in CANCEL_WORDS:
+        return await broadcast_cancel(update, context)
+    media_type, file_id, text = None, None, None
+    if message.text:
+        media_type, text = "text", message.text
+    elif message.photo:
+        media_type, file_id = "photo", message.photo[-1].file_id
+    elif message.video:
+        media_type, file_id = "video", message.video.file_id
+    elif message.audio:
+        media_type, file_id = "audio", message.audio.file_id
+    elif message.voice:
+        media_type, file_id = "voice", message.voice.file_id
+
+    if not media_type:
+        await message.reply_text("النوع ده مش مدعوم. ابعت نص أو صورة أو فيديو أو Audio أو Voice.")
+        return BROADCAST_CONTENT
+
+    context.user_data["broadcast_content"] = (media_type, file_id, text if text is not None else message.caption)
+    targets = context.user_data.get("broadcast_targets", [])
+    names = "، ".join(title or str(chat_id) for chat_id, title, _ in targets)
+
+    await message.reply_text("👀 دي معاينة الرسالة اللي هتتبعت:")
+    await send_reply(
+        context.bot, message.chat_id,
+        context.user_data["broadcast_content"][0],
+        context.user_data["broadcast_content"][1],
+        context.user_data["broadcast_content"][2]
+    )
+    await message.reply_text(
+        f"هتتبعت لـ {len(targets)} جروب: {names}\n\n"
+        "ابعت «نعم» للتأكيد أو «إلغاء» للإلغاء."
+    )
+    return BROADCAST_CONFIRM
+
+
+async def broadcast_confirm(update, context):
+    text = (update.effective_message.text or "").strip().casefold()
+    if text in CANCEL_WORDS:
+        return await broadcast_cancel(update, context)
+    if text not in CONFIRM_WORDS:
+        await update.effective_message.reply_text("ابعت «نعم» للتأكيد أو «إلغاء» للإلغاء.")
+        return BROADCAST_CONFIRM
+
+    targets = context.user_data.get("broadcast_targets", [])
+    media_type, file_id, caption = context.user_data.get("broadcast_content", (None, None, None))
+    sent, failed = [], []
+    for chat_id, title, _ in targets:
+        try:
+            await send_reply(context.bot, chat_id, media_type, file_id, caption)
+            sent.append(title or str(chat_id))
+        except Exception as exc:
+            log.exception("Broadcast to %s failed", chat_id)
+            failed.append((title or str(chat_id), type(exc).__name__))
+        await asyncio.sleep(BROADCAST_DELAY_SECONDS)
+
+    lines = [f"📢 البرودكاست خلص: اتبعت لـ {len(sent)} من {len(targets)} جروب."]
+    for title, error in failed:
+        lines.append(f"❌ {title} — {error}")
+    _clear_broadcast(context.user_data)
+    await update.effective_message.reply_text("\n".join(lines))
+    return ConversationHandler.END
+
+
+async def broadcast_cancel(update, context):
+    _clear_broadcast(context.user_data)
+    await update.effective_message.reply_text("اتلغى البرودكاست.")
+    return ConversationHandler.END
 
 
 # ---------- Send saved media/text into any group ----------
@@ -370,6 +531,30 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     private = filters.ChatType.PRIVATE
+
+    # Registered before the private media handler so media inside a
+    # broadcast conversation goes to the conversation, not to reply uploads.
+    broadcast_conversation = ConversationHandler(
+        entry_points=[CommandHandler("broadcast", broadcast_start, filters=private)],
+        states={
+            BROADCAST_TARGET: [
+                MessageHandler(private & filters.TEXT & ~filters.COMMAND, broadcast_target)
+            ],
+            BROADCAST_CONTENT: [
+                MessageHandler(
+                    private & (filters.TEXT | filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.VOICE)
+                    & ~filters.COMMAND,
+                    broadcast_content
+                )
+            ],
+            BROADCAST_CONFIRM: [
+                MessageHandler(private & filters.TEXT & ~filters.COMMAND, broadcast_confirm)
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", broadcast_cancel)],
+    )
+    app.add_handler(broadcast_conversation)
+
     for command, handler in [
         ("addreply", addreply), ("delreply", delreply), ("editreply", editreply),
         ("replies", replies), ("enable", enable), ("disable", disable)
@@ -381,6 +566,7 @@ def main():
 
     groups = filters.ChatType.GROUPS
     app.add_handler(CommandHandler("setup", setup, filters=groups))
+    app.add_handler(CommandHandler("setname", setname, filters=groups))
     app.add_handler(CommandHandler("lock", lock_cmd, filters=groups))
     app.add_handler(CommandHandler("unlock", unlock_cmd, filters=groups))
     app.add_handler(CommandHandler("help", help_cmd))

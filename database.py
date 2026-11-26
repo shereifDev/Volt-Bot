@@ -20,7 +20,7 @@ def connect():
 
 def init_db():
     with connect() as conn:
-        conn.execute("CREATE TABLE IF NOT EXISTS groups(chat_id INTEGER PRIMARY KEY, title TEXT)")
+        conn.execute("CREATE TABLE IF NOT EXISTS groups(chat_id INTEGER PRIMARY KEY, title TEXT, committee_name TEXT)")
         conn.execute("""CREATE TABLE IF NOT EXISTS global_replies(
             keyword TEXT PRIMARY KEY COLLATE NOCASE,
             response TEXT,
@@ -36,14 +36,45 @@ def init_db():
             conn.execute("ALTER TABLE global_replies ADD COLUMN media_type TEXT NOT NULL DEFAULT 'text'")
         if "file_id" not in columns:
             conn.execute("ALTER TABLE global_replies ADD COLUMN file_id TEXT")
+        # Migrate groups registered before committee names existed.
+        group_columns = {row[1] for row in conn.execute("PRAGMA table_info(groups)")}
+        if "committee_name" not in group_columns:
+            conn.execute("ALTER TABLE groups ADD COLUMN committee_name TEXT")
 
 
-def register_group(chat_id, title):
+def register_group(chat_id, title, committee_name=None):
     with connect() as conn:
-        conn.execute(
-            "INSERT INTO groups VALUES(?, ?) ON CONFLICT(chat_id) DO UPDATE SET title=excluded.title",
-            (chat_id, title)
+        conn.execute("""
+            INSERT INTO groups VALUES(?, ?, ?)
+            ON CONFLICT(chat_id) DO UPDATE SET
+                title=excluded.title,
+                committee_name=COALESCE(excluded.committee_name, groups.committee_name)
+        """, (chat_id, title, committee_name))
+
+
+def set_group_committee(chat_id, committee_name):
+    with connect() as conn:
+        cur = conn.execute(
+            "UPDATE groups SET committee_name=? WHERE chat_id=?",
+            (committee_name, chat_id)
         )
+        return cur.rowcount > 0
+
+
+def get_groups_detailed():
+    with connect() as conn:
+        return conn.execute(
+            "SELECT chat_id, title, committee_name FROM groups ORDER BY committee_name, title"
+        ).fetchall()
+
+
+def list_committee_names():
+    with connect() as conn:
+        return [row[0] for row in conn.execute("""
+            SELECT DISTINCT committee_name FROM groups
+            WHERE committee_name IS NOT NULL AND committee_name != ''
+            ORDER BY committee_name
+        """)]
 
 
 def get_groups():

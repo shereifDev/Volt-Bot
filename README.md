@@ -2,6 +2,7 @@
 
 ## What's new in v3
 - Group creator (`creator`) and group administrators (`administrator`) can both use `/setup`, `/lock`, and `/unlock`.
+- Committees: every group can be linked to a committee name, and the owner can broadcast a message to all groups or to selected committees.
 - Global replies support text, photo, video, audio, and voice.
 - Global replies are managed in the bot's private chat and work in every group containing the bot.
 - Existing v2 SQLite text replies are migrated automatically.
@@ -35,13 +36,22 @@ Commands:
 - `/disable keyword`
 
 ## Group commands
-- `/setup` — register the group and schedule midnight lock / 8 AM unlock.
+- `/setup committee name` — register the group and schedule midnight lock / 8 AM unlock. The committee name is optional; example: `/setup Python`.
+- `/setname committee name` — set or change the committee of an already-registered group.
 - `/lock` — lock now.
 - `/unlock` — unlock now.
 - `/help`
 
+## Broadcast (owner, private chat)
+1. Send `/broadcast` to the bot in private.
+2. Choose the target: reply `الكل` for every group, or one or more committee names separated by commas (Arabic or English commas).
+3. Send the message: text, photo, video, audio, or voice note.
+4. The bot sends the message back to you as a preview and asks for confirmation.
+5. Reply `نعم` to send or `إلغاء` (or `/cancel`) to cancel at any step.
+6. The bot sends group by group with a short delay to respect Telegram rate limits, then reports how many groups received it and which ones failed.
+
 ## Notes
-- Only IDs in OWNER_IDS can manage global replies.
+- Only IDs in OWNER_IDS can manage global replies and send broadcasts.
 - Group creator and group admins are both accepted for group commands.
 - The bot must be an admin with Restrict Members permission to change group permissions.
 - Test in a test group before broad deployment.
